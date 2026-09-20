@@ -8,6 +8,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi, to_ffi};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, make_array};
@@ -162,6 +163,66 @@ pub type LanceIndexBuildProgressCallback = Option<
     ),
 >;
 
+/// Shared retirement gate for the C progress callback bridge.
+///
+/// Lance core clones the installed progress handle into spawned worker tasks
+/// (e.g. the inverted index's `tokenize_docs` workers), and error paths can
+/// drop their `JoinHandle`s before the workers finish, so a detached clone
+/// can outlive the build that installed it. The gate turns callback
+/// retirement from a documentation contract into an enforced boundary: once
+/// `retire` returns, no callback invocation is in flight and every later
+/// entry becomes a no-op, so a detached clone can never touch the raw
+/// `callback`/`ctx` after the owning `execute_uncommitted` call has returned.
+#[derive(Debug, Default)]
+struct ProgressCallbackGate {
+    /// Set by `retire`; entries that observe it become no-ops.
+    retired: AtomicBool,
+    /// Number of C callback invocations currently executing.
+    in_flight: AtomicUsize,
+}
+
+impl ProgressCallbackGate {
+    /// Admit one callback invocation, or report that the gate is retired.
+    ///
+    /// The increment is ordered before the `retired` check (both SeqCst), so
+    /// an entry racing with `retire` either observes `retired` and backs out,
+    /// or is counted in `in_flight` and therefore awaited by `retire`'s
+    /// drain loop.
+    fn enter(&self) -> bool {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.retired.load(Ordering::SeqCst) {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    fn exit(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Disable new entries and wait for in-flight invocations to drain.
+    ///
+    /// A callback that blocks (violating its documented non-blocking
+    /// contract) stalls this drain rather than causing a use-after-free.
+    fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        while self.in_flight.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Retires the shared progress gate on drop, covering the success, error,
+/// and panic exits of `execute_uncommitted_inner`.
+struct ProgressRetireGuard(Arc<ProgressCallbackGate>);
+
+impl Drop for ProgressRetireGuard {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SendIndexBuildProgressCallback {
     callback: unsafe extern "C" fn(
@@ -173,13 +234,18 @@ struct SendIndexBuildProgressCallback {
         completed: u64,
     ),
     ctx: *mut c_void,
+    /// Shared with every clone core hands to worker tasks; retired before the
+    /// owning `execute_uncommitted` call returns.
+    gate: Arc<ProgressCallbackGate>,
 }
 
 // SAFETY: The C API requires the callback and its context to remain valid and
-// safe to invoke until the segment builder is freed, and the builder is
-// single-use, so no invocation can outlive the builder. Certain build stages
-// report progress concurrently from parallel worker tasks, so the callback
-// may be invoked concurrently; the C contract requires it to be thread-safe.
+// safe to invoke until `execute_uncommitted` returns, and the shared gate
+// guarantees no invocation is in flight — and no new one can start — once
+// that boundary is reached, so no invocation can touch the raw context after
+// retirement. Certain build stages report progress concurrently from parallel
+// worker tasks, so the callback may be invoked concurrently; the C contract
+// requires it to be thread-safe.
 unsafe impl Send for SendIndexBuildProgressCallback {}
 unsafe impl Sync for SendIndexBuildProgressCallback {}
 
@@ -202,8 +268,14 @@ fn progress_c_string(value: &str) -> Result<CString> {
 #[async_trait::async_trait]
 impl IndexBuildProgress for SendIndexBuildProgressCallback {
     async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> Result<()> {
+        // Strings are built before entering the gate so the defensive `?`
+        // paths cannot leak an in-flight count; after `enter` the only code
+        // is the FFI call, so `exit` always runs.
         let stage = progress_c_string(stage)?;
         let unit = progress_c_string(unit)?;
+        if !self.gate.enter() {
+            return Ok(());
+        }
         unsafe {
             (self.callback)(
                 self.ctx,
@@ -214,11 +286,15 @@ impl IndexBuildProgress for SendIndexBuildProgressCallback {
                 0,
             )
         };
+        self.gate.exit();
         Ok(())
     }
 
     async fn stage_progress(&self, stage: &str, completed: u64) -> Result<()> {
         let stage = progress_c_string(stage)?;
+        if !self.gate.enter() {
+            return Ok(());
+        }
         unsafe {
             (self.callback)(
                 self.ctx,
@@ -229,11 +305,15 @@ impl IndexBuildProgress for SendIndexBuildProgressCallback {
                 completed,
             )
         };
+        self.gate.exit();
         Ok(())
     }
 
     async fn stage_complete(&self, stage: &str) -> Result<()> {
         let stage = progress_c_string(stage)?;
+        if !self.gate.enter() {
+            return Ok(());
+        }
         unsafe {
             (self.callback)(
                 self.ctx,
@@ -244,6 +324,7 @@ impl IndexBuildProgress for SendIndexBuildProgressCallback {
                 0,
             )
         };
+        self.gate.exit();
         Ok(())
     }
 }
@@ -1085,7 +1166,14 @@ unsafe fn execute_uncommitted_inner(
     }
 
     let columns = [builder.column.as_str()];
-    let metadata = match &builder.kind {
+    // Retire the shared progress gate before this call returns — on success,
+    // error, and panic paths alike — so a detached core worker holding a
+    // progress clone can no longer enter the C callback afterwards.
+    let _progress_retire = builder
+        .progress
+        .as_ref()
+        .map(|progress| ProgressRetireGuard(progress.gate.clone()));
+    let result = match &builder.kind {
         SegmentKind::Scalar {
             scalar_type,
             params_json,
@@ -1109,7 +1197,7 @@ unsafe fn execute_uncommitted_inner(
             if let Some(progress) = builder.progress.clone() {
                 core_builder = core_builder.progress(Arc::new(progress));
             }
-            block_on(core_builder.execute_uncommitted())?
+            block_on(core_builder.execute_uncommitted())
         }
         SegmentKind::Vector {
             params,
@@ -1137,9 +1225,10 @@ unsafe fn execute_uncommitted_inner(
             }
             // Core's train=false means "create an empty index".  Model presence
             // itself controls whether IVF/PQ training is skipped.
-            block_on(core_builder.train(true).execute_uncommitted())?
+            block_on(core_builder.train(true).execute_uncommitted())
         }
     };
+    let metadata = result?;
     let bytes = pb::IndexMetadata::from(&metadata).encode_to_vec();
     let allocation = unsafe { libc::malloc(bytes.len()) }.cast::<u8>();
     if allocation.is_null() {
@@ -1160,12 +1249,13 @@ unsafe fn execute_uncommitted_inner(
 /// builder.
 ///
 /// The callback is invoked from lance-c's internal tokio runtime worker
-/// threads while `lance_index_segment_builder_execute_uncommitted` runs.
-/// Lance core may deliver events from spawned worker tasks, and error paths
-/// can detach them before they finish, so the callback and `callback_ctx`
-/// must remain valid until the builder is freed rather than being retired
-/// when `execute_uncommitted` returns. Certain stages report progress
-/// concurrently from parallel worker tasks, so the callback must be
+/// threads while `lance_index_segment_builder_execute_uncommitted` runs, and
+/// only while it runs: lance-c disables and drains the callback through a
+/// shared retirement gate before `execute_uncommitted` returns (including on
+/// error), so a core worker task detached by an error path can never enter
+/// the callback afterwards. The callback and `callback_ctx` must therefore
+/// remain valid until `execute_uncommitted` returns. Certain stages report
+/// progress concurrently from parallel worker tasks, so the callback must be
 /// thread-safe and reentrant, must be non-blocking, and must not call back
 /// into any `lance_*` function. It is invoked without a panic guard: it must
 /// return normally, because unwinding or throwing across this boundary can
@@ -1203,6 +1293,9 @@ unsafe fn set_progress_callback_inner(
     builder.progress = Some(SendIndexBuildProgressCallback {
         callback,
         ctx: callback_ctx,
+        // A replacement gets a fresh gate: the previous callback was never
+        // shared with a build, so there is nothing to retire.
+        gate: Arc::new(ProgressCallbackGate::default()),
     });
     Ok(0)
 }
@@ -1678,5 +1771,135 @@ pub unsafe extern "C" fn lance_index_segment_metadata_free(
         swallow_unwind("lance_index_segment_metadata_free", || unsafe {
             drop(Box::from_raw(metadata));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct LateCallState {
+        entered_after_retire: AtomicBool,
+    }
+
+    unsafe extern "C" fn record_late_entry(
+        ctx: *mut c_void,
+        _event: i32,
+        _stage: *const c_char,
+        _total: u64,
+        _unit: *const c_char,
+        _completed: u64,
+    ) {
+        let state = unsafe { &*ctx.cast::<LateCallState>() };
+        state.entered_after_retire.store(true, Ordering::SeqCst);
+    }
+
+    /// Regression test for the review finding that a progress clone held by a
+    /// detached core worker task (e.g. the inverted index's tokenize_docs
+    /// workers) must not enter the C callback once the owning build has
+    /// retired the gate at the end of `execute_uncommitted`.
+    #[test]
+    fn detached_clone_cannot_enter_callback_after_retire() {
+        let state = Box::new(LateCallState {
+            entered_after_retire: AtomicBool::new(false),
+        });
+        let ctx = Box::into_raw(state);
+        let bridge = SendIndexBuildProgressCallback {
+            callback: record_late_entry,
+            ctx: ctx.cast(),
+            gate: Arc::new(ProgressCallbackGate::default()),
+        };
+        let detached = Arc::new(bridge.clone());
+        // Simulate the retirement boundary at the end of execute_uncommitted:
+        // the builder's own handle is gone and the gate is retired, while a
+        // detached worker still holds its clone.
+        drop(bridge);
+        detached.gate.retire();
+        crate::runtime::block_on(async move {
+            tokio::task::spawn(async move {
+                detached
+                    .stage_progress("tokenize_docs", 1)
+                    .await
+                    .expect("a late progress call must be a no-op, not an error");
+            })
+            .await
+            .unwrap();
+        });
+        let state = unsafe { Box::from_raw(ctx) };
+        assert!(
+            !state.entered_after_retire.load(Ordering::SeqCst),
+            "detached clone entered the C callback after retirement"
+        );
+    }
+
+    struct BlockingState {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    unsafe extern "C" fn blocking_callback(
+        ctx: *mut c_void,
+        _event: i32,
+        _stage: *const c_char,
+        _total: u64,
+        _unit: *const c_char,
+        _completed: u64,
+    ) {
+        let state = unsafe { &*ctx.cast::<BlockingState>() };
+        state.entered.send(()).unwrap();
+        state.release.recv().unwrap();
+    }
+
+    /// `retire` must disable new entries and then wait until every in-flight
+    /// invocation has exited before returning.
+    #[test]
+    fn retire_drains_in_flight_invocation() {
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let state = Box::new(BlockingState {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let ctx = Box::into_raw(state);
+        let bridge = SendIndexBuildProgressCallback {
+            callback: blocking_callback,
+            ctx: ctx.cast(),
+            gate: Arc::new(ProgressCallbackGate::default()),
+        };
+        let gate = bridge.gate.clone();
+
+        // Park one invocation inside the C callback.
+        let caller = std::thread::spawn(move || {
+            crate::runtime::block_on(bridge.stage_progress("shuffle", 1)).unwrap();
+        });
+        entered_rx.recv().unwrap();
+
+        let retire_returned = Arc::new(AtomicBool::new(false));
+        let retire_thread = {
+            let gate = gate.clone();
+            let retire_returned = retire_returned.clone();
+            std::thread::spawn(move || {
+                gate.retire();
+                retire_returned.store(true, Ordering::SeqCst);
+            })
+        };
+        // Wait until retirement has actually disabled new entries...
+        while !gate.retired.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // ...then prove it is still draining the in-flight invocation.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !retire_returned.load(Ordering::SeqCst),
+            "retire returned while a callback invocation was in flight"
+        );
+        // Unblock the callback; the drain must now complete.
+        release_tx.send(()).unwrap();
+        caller.join().unwrap();
+        retire_thread.join().unwrap();
+        assert!(retire_returned.load(Ordering::SeqCst));
+        drop(unsafe { Box::from_raw(ctx) });
     }
 }

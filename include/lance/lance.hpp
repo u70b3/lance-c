@@ -1286,11 +1286,13 @@ public:
     /// from parallel worker tasks, so it must be thread-safe, non-blocking,
     /// and must not re-enter any lance_* function. It must return normally;
     /// unwinding or throwing across this boundary can abort the host process.
-    /// The callback and a non-null context must remain valid until the
-    /// builder is released: core may deliver events from spawned worker
-    /// tasks, and error paths can detach them before they finish, so do not
-    /// retire them when execute_uncommitted returns. Progress reporting is
-    /// advisory and cannot affect the build outcome.
+    /// Invocations occur only while execute_uncommitted runs, and this is
+    /// enforced: lance-c disables the callback and drains in-flight
+    /// invocations before that call returns, including on error, so a worker
+    /// task detached by core can never invoke it afterwards. The callback and
+    /// the context (if non-null) must remain valid until execute_uncommitted
+    /// returns. Progress reporting is advisory and cannot affect the build
+    /// outcome.
     IndexSegmentBuilder& progress_callback(LanceIndexBuildProgressCallback callback,
                                            void* callback_ctx) {
         if (lance_index_segment_builder_set_progress_callback(handle_.get(), callback,

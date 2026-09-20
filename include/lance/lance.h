@@ -1846,6 +1846,11 @@ typedef enum {
  *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
  *    and `completed` is 0.
  *
+ * Stage names are index-type-specific (e.g. "train_ivf", "shuffle",
+ * "merge_partitions" for vector indices; "load_data" for scalar indices) and
+ * are diagnostic-only: they are not a stable cross-version contract, so
+ * consumers must treat them as opaque strings.
+ *
  * The callback is invoked from lance-c's internal tokio runtime worker
  * threads. Certain stages report progress concurrently from parallel worker
  * tasks, so the callback MUST be thread-safe and reentrant. It must be
@@ -1875,14 +1880,15 @@ typedef void (*LanceIndexBuildProgressCallback)(
  * NULL. `callback_ctx` may be NULL and is passed through to the callback
  * opaquely. Setting a callback replaces any previously set callback.
  *
- * `callback` and `callback_ctx` must remain valid and safe to invoke until the
- * builder is released with lance_index_segment_builder_free. Invocations only
- * occur while lance_index_segment_builder_execute_uncommitted is executing.
- * Lance core may deliver events from spawned worker tasks, and error paths can
- * detach them before they finish; keep callback and callback_ctx valid until
- * the builder is released rather than retiring them when execute returns. See
- * LanceIndexBuildProgressCallback for the full threading and reentrancy
- * contract.
+ * Invocations occur only while lance_index_segment_builder_execute_uncommitted
+ * is executing, and this is enforced rather than contractual: lance-c
+ * disables the callback and drains in-flight invocations through a retirement
+ * gate before that call returns, including on error, so a worker task
+ * detached by lance core on an error path can never invoke the callback
+ * afterwards. `callback` and `callback_ctx` must therefore remain valid and
+ * safe to invoke until lance_index_segment_builder_execute_uncommitted
+ * returns. See LanceIndexBuildProgressCallback for the full threading and
+ * reentrancy contract.
  *
  * @return 0 on success, -1 on error.
  */
